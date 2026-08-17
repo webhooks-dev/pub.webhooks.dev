@@ -1,0 +1,9 @@
+# macOS cruft
+.DS_Store
+
+# Local scratch from testing install.sh or dry-running the release pipeline.
+# Real artifacts live in GitHub Releases, never in the tree.
+/dist/
+*.tar.gz
+SHA256SUMS
+latest.json
