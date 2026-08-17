@@ -16,25 +16,25 @@ release.yml: matrix build of whk, whkd, whk-mcp
   macOS aarch64 ─ codesign + notarize ─ tar
   macOS x86_64  ─ codesign + notarize ─ tar
   Linux x86_64  ─────────────────────── tar
-  Linux aarch64 (via cross) ─────────── tar
+  Linux aarch64 ─────────────────────── tar
         │
         ▼
-aggregate job: SHA256SUMS + latest.json
-        │
-        ▼
+publish job: SHA256SUMS + latest.json, then
 gh release create on webhooks-dev/pub.webhooks.dev   (PUB_RELEASE_TOKEN)
 ```
 
 Only the three consumer binaries ship. The cell binaries (`whk-ingest`, `whk-egress`) are **not**
 public artifacts — they deploy via the fleet pattern (SPEC §10). The Tauri `app/` bundle joins the
-matrix once it has UI to ship, on the macOS legs (it's excluded from the Cargo workspace because
-its Linux build needs GTK/WebKit — SPEC §2 D7).
+matrix once it has UI to ship, on the macOS legs — `release.yml` already carries the job as a
+commented-out scaffold (it's excluded from the Cargo workspace because its Linux build needs
+GTK/WebKit — SPEC §2 D7).
 
 ## Cutting a release
 
 1. On `main`, with CI green: bump `[workspace.package] version` in `Cargo.toml` to match the tag
-   you're about to push (the workflow should refuse a tag whose version disagrees with the
-   manifest — a mismatch here means `whk --version` lies).
+   you're about to push. The workflow does **not** cross-check the tag against the manifest today
+   — getting them to agree is on whoever tags, and a mismatch means `whk --version` lies about
+   what's installed.
 2. `git tag v0.1.0 && git push origin v0.1.0`. Tags matching `v*` trigger `release.yml`; nothing
    else does.
 3. Watch the run. When it finishes, the release `v0.1.0` on
@@ -51,13 +51,23 @@ tag breaks anyone mid-download or pinned to it.
 
 | leg | runner | target triple | signed |
 |---|---|---|---|
-| macOS arm64 | `macos-14` (Apple silicon) | `aarch64-apple-darwin` | Developer ID + notarized |
-| macOS x86_64 | `macos-14`, cross-compiling with `--target x86_64-apple-darwin` | `x86_64-apple-darwin` | Developer ID + notarized |
+| macOS arm64 | `macos-15` (Apple silicon) | `aarch64-apple-darwin` | Developer ID + notarized |
+| macOS x86_64 | `macos-15-intel` | `x86_64-apple-darwin` | Developer ID + notarized |
 | Linux x86_64 | `ubuntu-latest` | `x86_64-unknown-linux-gnu` | no |
-| Linux arm64 | `ubuntu-latest` + [`cross`](https://github.com/cross-rs/cross) (SPEC §10: "aarch64 via cross") | `aarch64-unknown-linux-gnu` | no |
+| Linux arm64 | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | no |
 
-Every leg builds `--release` for exactly `whk`, `whkd`, `whk-mcp` (`cargo build --release
---target <triple> -p whk-cli -p whkd -p whk-mcp`).
+Every leg runs **natively** on a runner of its own architecture — there is no cross-compilation
+anywhere in the matrix. (SPEC §10 says "aarch64 via cross"; the workflow uses GitHub's hosted arm
+runner instead, which reaches the same target triple without a cross toolchain.) Each leg builds
+exactly the three consumer binaries:
+
+```sh
+cargo build --release --locked --target "$TARGET" -p whk-cli -p whkd -p whk-mcp
+```
+
+(`whk-cli` is the crate; its binary is named `whk`. `--target` is passed even though every runner
+is native — it pins the output path to `target/<triple>/release/`, so the sign/package steps
+never guess.)
 
 Windows has no leg — see the last section.
 
@@ -102,23 +112,26 @@ On each macOS leg, after the build:
    `security set-key-partition-list -S apple-tool:,apple:` so codesign can use the key without a
    UI prompt. The keychain is deleted in a cleanup step that runs even on failure.
 2. **Codesign** each binary with the hardened runtime and a secure timestamp — both are
-   notarization requirements:
+   notarization requirements. The signing identity is not hardcoded: the workflow looks it up in
+   the ephemeral keychain (`security find-identity -v -p codesigning`), matching "Developer ID
+   Application" plus `APPLE_TEAM_ID`, and fails the leg if none is found. Then, per binary:
 
    ```sh
    codesign --force --options runtime --timestamp \
-     --sign "Developer ID Application: <name> ($APPLE_TEAM_ID)" whk whkd whk-mcp
+     --keychain "$KEYCHAIN" --sign "$IDENTITY" "target/$TARGET/release/$bin"
+   codesign --verify --strict "target/$TARGET/release/$bin"
    ```
-3. **Notarize.** Zip the signed binaries (`ditto -c -k`) and submit:
+3. **Notarize.** Zip the three signed binaries and submit:
 
    ```sh
-   xcrun notarytool submit whk-notarize.zip \
+   xcrun notarytool submit "whk-notarize-$TARGET.zip" \
      --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
-     --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait
+     --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait --output-format json
    ```
 
-   `--wait` blocks until Apple's verdict. On `Invalid`, fetch the reasons with
-   `xcrun notarytool log <submission-id>` — the usual causes are a missing hardened runtime or
-   timestamp.
+   `--wait` blocks until Apple's verdict; the leg fails unless the status is `Accepted`, and on
+   anything else it prints `xcrun notarytool log <submission-id>` before dying — the usual causes
+   are a missing hardened runtime or timestamp.
 4. **No stapling — deliberately.** `stapler staple` works on app bundles, disk images, and
    installer packages, not on flat Mach-O executables, so the notarization ticket cannot travel
    inside these tarballs. Gatekeeper resolves the ticket from Apple's servers on first assessment
@@ -126,7 +139,8 @@ On each macOS leg, after the build:
    run on a fully offline machine can't confirm notarization; and `curl`-fetched files (the
    `install.sh` path) never get the quarantine attribute, so Gatekeeper typically doesn't engage
    there at all. The signature still protects integrity everywhere
-   (`codesign --verify --strict`).
+   (`codesign --verify --strict`). This is specific to flat executables: when the Tauri `app/`
+   bundle eventually joins the matrix, its `.app`/`.dmg` **can and should** be stapled.
 5. **Tar** the signed, notarized binaries. Tarring must happen after signing — the signature is
    embedded in each Mach-O, so order matters here only in that you must not sign a copy and ship
    another.
@@ -151,9 +165,10 @@ latest.json
   `whk-0.1.0-aarch64-apple-darwin.tar.gz`, `latest.json` `"version": "0.1.0"`.
 - Each tarball contains `whk`, `whkd`, `whk-mcp` **at the top level** — no wrapping directory.
   `install.sh` extracts and expects the three files at the root; changing the layout breaks it.
-- `SHA256SUMS` is generated by the aggregate job after all legs finish, in `sha256sum` output
+- `SHA256SUMS` is generated by the publish job after all legs finish, in `sha256sum` output
   format (`<64-hex>  <filename>`), one line per tarball. Both `sha256sum -c` and
-  `shasum -a 256 -c` accept it.
+  `shasum -a 256 -c` accept it. The job counts the tarballs first and refuses to publish
+  anything other than exactly four — a partial release never ships.
 - `latest.json` — the machine-readable pointer, fetchable at the stable URL
   `…/releases/latest/download/latest.json`:
 
@@ -175,9 +190,12 @@ latest.json
   hex of the tarball, identical to the `SHA256SUMS` line). Consumers must ignore unknown fields;
   additions are non-breaking, and a key only ever means what this schema says.
 
-Publishing is one `gh release create v<version> --repo webhooks-dev/pub.webhooks.dev
---verify-tag=false --title … --notes …` with `GH_TOKEN=$PUB_RELEASE_TOKEN` and the six files as
-arguments. The tag exists only in the private repo; here the release itself carries the version.
+Publishing is one `gh release create v<version> --repo webhooks-dev/pub.webhooks.dev --title …
+--notes-file …` with `GH_TOKEN=$PUB_RELEASE_TOKEN` and the six files as arguments. Since
+`v<version>` doesn't exist in this repo, `gh` creates the tag at the current tip of `main` here —
+it does **not** point at the source, which stays private; the release assets carry the version.
+The workflow's own `GITHUB_TOKEN` never touches this repo (its permissions are `contents: read`
+on the source repo); the cross-repo publish rides entirely on `PUB_RELEASE_TOKEN`.
 
 ## Windows: why not, and what it would take
 
