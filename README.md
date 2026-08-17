@@ -116,5 +116,5 @@ never values), signing/notarization flow, and limitations — is
 
 There's no formal security policy yet (this is an MVP). If you find a vulnerability in these
 binaries, the installer, or the release pipeline, report it privately to
-**wilson.elijah96@gmail.com** — please don't open a public issue for it, and don't include webhook
+**dev.tizz98@gmail.com** — please don't open a public issue for it, and don't include webhook
 payloads or secrets in the report.
